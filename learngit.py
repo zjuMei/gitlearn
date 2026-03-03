@@ -1,5 +1,8 @@
+import json
+import pathlib
 import random
 import sys
+from collections import deque
 
 import pygame
 
@@ -83,13 +86,35 @@ MODES = {
     "wrap": "Wrap",
 }
 
+SAVE_FILE = pathlib.Path("save.json")
+
+
+def load_high_score() -> int:
+    try:
+        return json.loads(SAVE_FILE.read_text()).get("high_score", 0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+
+
+def save_high_score(score: int) -> None:
+    SAVE_FILE.write_text(json.dumps({"high_score": score}))
+
 
 def is_opposite(d1: pygame.Vector2, d2: pygame.Vector2) -> bool:
     return d1.x == -d2.x and d1.y == -d2.y
 
 
 def is_pause_key(event: pygame.event.Event) -> bool:
-    return event.key in (pygame.K_p, pygame.K_ESCAPE, pygame.K_PAUSE)
+    return event.key in (pygame.K_p, pygame.K_PAUSE)
+
+
+# Snake head eye offsets per direction (dx, dy) -> (eye1_offset, eye2_offset)
+_EYE_OFFSETS = {
+    (1,  0): (( 4, -4), ( 4,  4)),
+    (-1, 0): ((-4, -4), (-4,  4)),
+    (0,  1): ((-4,  4), ( 4,  4)),
+    (0, -1): ((-4, -4), ( 4, -4)),
+}
 
 
 class Snake:
@@ -103,20 +128,23 @@ class Snake:
             pygame.Vector2(5, 12),
         ]
         self.direction = pygame.Vector2(1, 0)
-        self.next_direction = pygame.Vector2(1, 0)
+        self._dir_queue = deque(maxlen=2)  # type: deque
 
     def queue_direction(self, new_direction: pygame.Vector2):
-        if not is_opposite(self.direction, new_direction):
-            self.next_direction = new_direction
+        # Use the last queued direction (or current) to check for reversal
+        last = self._dir_queue[-1] if self._dir_queue else self.direction
+        if not is_opposite(last, new_direction):
+            self._dir_queue.append(new_direction)
 
     def next_head(self) -> pygame.Vector2:
-        self.direction = self.next_direction
+        if self._dir_queue:
+            self.direction = self._dir_queue.popleft()
         return self.body[0] + self.direction
 
 
 class Game:
     def __init__(self):
-        self.high_score = 0
+        self.high_score = load_high_score()
         self.snake = Snake()
         self.food = pygame.Vector2(0, 0)
         self.obstacles = set()
@@ -126,9 +154,21 @@ class Game:
         self.in_menu = True
         self.difficulty = "normal"
         self.mode = "classic"
+        self._board_surface = self._build_board_surface()
+        self._overlay_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        self._overlay_surface.fill(OVERLAY)
         self.spawn_food()
         self.generate_obstacles(self.target_obstacle_count())
         pygame.time.set_timer(MOVE_EVENT, 0)
+
+    @staticmethod
+    def _build_board_surface() -> pygame.Surface:
+        surf = pygame.Surface((WINDOW_WIDTH, GRID_HEIGHT * CELL_SIZE))
+        for x in range(GRID_WIDTH):
+            for y in range(GRID_HEIGHT):
+                color = BG_LIGHT if (x + y) % 2 == 0 else BG_DARK
+                pygame.draw.rect(surf, color, pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE))
+        return surf
 
     def movement_interval(self) -> int:
         config = DIFFICULTIES[self.difficulty]
@@ -190,6 +230,13 @@ class Game:
         blocked = {tuple(map(int, part)) for part in self.snake.body}
         blocked.add((int(self.food.x), int(self.food.y)))
 
+        # Safety zone: exclude cells within Manhattan distance 2 of the snake head
+        hx, hy = int(self.snake.body[0].x), int(self.snake.body[0].y)
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                if abs(dx) + abs(dy) <= 2:
+                    blocked.add((hx + dx, hy + dy))
+
         all_cells = [
             (x, y)
             for x in range(GRID_WIDTH)
@@ -215,8 +262,11 @@ class Game:
             next_head.x %= GRID_WIDTH
             next_head.y %= GRID_HEIGHT
 
-        # Hit self
-        if next_head in self.snake.body:
+        # Hit self — exclude tail only when the snake won't grow this step,
+        # because the tail will be removed before the new head occupies its cell.
+        eating = next_head == self.food
+        body_to_check = self.snake.body if eating else self.snake.body[:-1]
+        if next_head in body_to_check:
             self.game_over = True
             return
 
@@ -227,9 +277,10 @@ class Game:
 
         self.snake.body.insert(0, next_head)
 
-        if next_head == self.food:
+        if eating:
             self.score += 1
             self.high_score = max(self.high_score, self.score)
+            save_high_score(self.high_score)
             self.spawn_food()
             self.generate_obstacles(self.target_obstacle_count())
             self.set_timer_for_current_speed()
@@ -237,11 +288,7 @@ class Game:
             self.snake.body.pop()
 
     def draw_board(self):
-        for x in range(GRID_WIDTH):
-            for y in range(GRID_HEIGHT):
-                color = BG_LIGHT if (x + y) % 2 == 0 else BG_DARK
-                rect = pygame.Rect(x * CELL_SIZE, BOARD_TOP + y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
-                pygame.draw.rect(screen, color, rect)
+        screen.blit(self._board_surface, (0, BOARD_TOP))
 
     def draw_food(self):
         center = (
@@ -276,22 +323,10 @@ class Game:
         head = self.snake.body[0]
         head_center_x = int(head.x * CELL_SIZE + CELL_SIZE / 2)
         head_center_y = int(BOARD_TOP + head.y * CELL_SIZE + CELL_SIZE / 2)
-        offset = 4
-        if self.snake.direction.x == 1:
-            eye1 = (head_center_x + offset, head_center_y - offset)
-            eye2 = (head_center_x + offset, head_center_y + offset)
-        elif self.snake.direction.x == -1:
-            eye1 = (head_center_x - offset, head_center_y - offset)
-            eye2 = (head_center_x - offset, head_center_y + offset)
-        elif self.snake.direction.y == 1:
-            eye1 = (head_center_x - offset, head_center_y + offset)
-            eye2 = (head_center_x + offset, head_center_y + offset)
-        else:
-            eye1 = (head_center_x - offset, head_center_y - offset)
-            eye2 = (head_center_x + offset, head_center_y - offset)
-
-        pygame.draw.circle(screen, PANEL_BG, eye1, 2)
-        pygame.draw.circle(screen, PANEL_BG, eye2, 2)
+        dir_key = (int(self.snake.direction.x), int(self.snake.direction.y))
+        (ox1, oy1), (ox2, oy2) = _EYE_OFFSETS[dir_key]
+        pygame.draw.circle(screen, PANEL_BG, (head_center_x + ox1, head_center_y + oy1), 2)
+        pygame.draw.circle(screen, PANEL_BG, (head_center_x + ox2, head_center_y + oy2), 2)
 
     def draw_hud(self):
         panel = pygame.Rect(0, 0, WINDOW_WIDTH, HUD_HEIGHT)
@@ -316,9 +351,7 @@ class Game:
         screen.blit(hint_text, (12, 34))
 
     def draw_overlay(self, title: str, subtitle: str):
-        overlay_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        overlay_surface.fill(OVERLAY)
-        screen.blit(overlay_surface, (0, 0))
+        screen.blit(self._overlay_surface, (0, 0))
 
         title_surf = font_large.render(title, True, TEXT_PRIMARY)
         subtitle_surf = font_small.render(subtitle, True, TEXT_ACCENT)
